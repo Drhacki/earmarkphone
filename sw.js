@@ -1,9 +1,9 @@
 // Keeps a copy of Earmark's own files on the phone, so the app opens without internet. It always
 // tries the internet first, so a new version arrives as soon as there's a connection. Lectures and
 // progress aren't here: they're in the app's own storage. Requests to Gemini are never touched.
-const CACHE = "earmark-v1";
+const CACHE = "earmark-v2";
 const FILES = ["./", "index.html", "app.js", "style.css", "manifest.json", "icon-192.png", "icon-512.png",
-               "core/server.js", "core/store.js", "core/ai.js", "core/text.js", "core/audio.js"];
+               "core/server.js", "core/store.js", "core/ai.js", "core/text.js", "core/audio.js", "core/documents.js"];
 
 self.addEventListener("install", event => {
   event.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES)));

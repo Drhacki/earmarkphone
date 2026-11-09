@@ -5,7 +5,8 @@
 import * as db from "./store.js";
 import * as ai from "./ai.js";
 import * as T from "./text.js";
-import { pieces, duration as audioDuration, answerWav } from "./audio.js";
+import * as D from "./documents.js";
+import { pieces, duration as audioDuration, answerWav, speechPcm, wavHeader, PCM_RATE } from "./audio.js";
 
 const SESSION_SIZE = 10, NEW_PER_DAY = 15, PASS_MARK = 0.6, MIN_SPLIT_SECONDS = 360;
 const RECALL_DAYS = [3, 7, 21, 60], BUSY_WAITS = [30, 60, 120, 240];
@@ -18,13 +19,17 @@ class HttpError extends Error { constructor(message, status = 400) { super(messa
 
 // ---------------------------------------------------------------- settings
 
-const DEFAULT_SETTINGS = { gemini_key: "", gemini_model: "gemini-3.8-flash" };
+const DEFAULT_SETTINGS = { gemini_key: "", gemini_model: "gemini-3.8-flash", use_refs: true, refs_store: "" };
 export async function settings() { return { ...DEFAULT_SETTINGS, ...((await db.kvGet("settings")) || {}) }; }
 const hasAi = s => !!s.gemini_key;
 function publicSettings(s) {
   return { provider: "gemini", gemini_key: !!s.gemini_key, gemini_tail: s.gemini_key.length >= 8 ? s.gemini_key.slice(-4) : "",
-           gemini_model: s.gemini_model, gemini_models: ai.MODELS };
+           gemini_model: s.gemini_model, gemini_models: ai.MODELS, use_refs: !!s.use_refs, refs_store: !!s.refs_store };
 }
+/** References are used when the learner allows it and at least one has finished indexing. */
+const refsActive = s => hasAi(s) && !!s.use_refs && !!s.refs_store && db.where("refs", r => r.status === "ready").length > 0;
+const extOf = name => (String(name).toLowerCase().match(/\.[a-z0-9]+$/) || [""])[0];
+const newId = () => crypto.randomUUID().replace(/-/g, "").slice(0, 12);
 
 // ---------------------------------------------------------------- recordings
 
@@ -68,10 +73,13 @@ async function runJobs() {
   while (queue.length) {
     const [kind, sid] = queue.shift();
     try {
-      if (kind === "reanalyse") await analyse(sid, await db.wordsGet(sid), db.one("sources", sid).duration);
+      if (kind === "reference") await uploadReference(sid);
+      else if (kind === "reanalyse") await analyse(sid, await db.wordsGet(sid), db.one("sources", sid).duration);
+      else if (kind === "document") await readDocument(sid);
       else await importSource(sid);
     } catch (e) {
       console.error(e);
+      if (kind === "reference") { db.update("refs", sid, { status: "failed", error: e.message }); continue; }
       const kept = kind === "reanalyse" && db.where("chapters", c => c.source_id === sid).length;
       if (kept) db.update("sources", sid, { status: "ready", stage: null, progress: 1, error: null,
         note: `Re-pick terms didn't finish, so the earlier chapters and terms are kept. ${e.message}` });
@@ -82,20 +90,31 @@ async function runJobs() {
   running = false;
 }
 
-/** Lectures left half-imported when the app was closed carry on. */
+/** What a lecture still needs: picking chapters and terms from its saved transcript, reading a
+    document aloud (sections already read are kept), or importing a recording. */
+const jobFor = s => s?.words_saved ? "reanalyse" : s?.doc ? "document" : "import";
+
+/** Lectures left half-imported, and references left uploading, when the app was closed carry on. */
 export function resumeJobs() {
   for (const s of db.where("sources", s => s.status === "queued" || s.status === "processing")) {
     db.update("sources", s.id, { status: "queued", stage: "Waiting" });
-    queueJob(s.words_saved ? "reanalyse" : "import", s.id);
+    queueJob(jobFor(s), s.id);
+  }
+  for (const r of db.where("refs", r => r.status === "queued" || r.status === "uploading")) {
+    db.update("refs", r.id, { status: "queued" });
+    queueJob("reference", r.id);
   }
 }
+
+/** What the lecture's status says while a busy Gemini, or a lost connection, is waited out. */
+const waitingFor = (e, wait) => `${e.offline ? "No internet connection" : "Gemini is busy"}, so waiting ${wait} seconds to try again`;
 
 async function transcribe(s, sid, piece) {
   for (const wait of [...BUSY_WAITS, null]) {
     try { return await ai.transcribePiece(s, piece); }
     catch (e) {
       if (!(e instanceof ai.AiBusy) || wait === null) throw e;
-      db.update("sources", sid, { stage: `Gemini is busy, so waiting ${wait} seconds to try again` });
+      db.update("sources", sid, { stage: waitingFor(e, wait) });
       await sleep(wait * 1000);
       db.update("sources", sid, { stage: "Transcribing with Gemini" });
     }
@@ -145,6 +164,113 @@ async function importSource(sid) {
   await analyse(sid, words, total);
 }
 
+/** Reads a PDF, Word file or notes aloud with a Gemini voice, section by section, into one
+    recording, then picks chapters and terms like any lecture. Sections already read are kept, so
+    Retry carries on where it stopped. The words are the text itself, spread over the time each
+    section takes to say, so nothing needs transcribing and terms are spelled as written. */
+async function readDocument(sid) {
+  const src = db.one("sources", sid);
+  const s = await settings();
+  if (!hasAi(s)) throw new Error("Gemini reads the text aloud on the phone. Add your Gemini key in Settings, then press Retry.");
+  db.update("sources", sid, { status: "processing", stage: "Reading the text", progress: 0.02, error: null });
+  const file = await db.fileGet(`doc:${sid}`);
+  if (!file) throw new Error("This file isn't on this phone any more. Delete this lecture and add the file again.");
+  let text;
+  try { text = await D.extract(file, src.doc); } catch (e) { throw new Error(e.message || "This file couldn't be read."); }
+  const [cleaned, cut] = D.shorten(D.clean(text));
+  if (cleaned.length < 200) throw new Error("There's hardly any text in this file. A scanned PDF holds pictures of pages, not text, so it can't be read aloud.");
+  const parts = D.sections(cleaned), two = src.voice === "gemini2";
+  let done = (await db.kvGet(`docread:${sid}`)) || null;
+  if (!done || done.count !== parts.length) {
+    await db.fileDelPrefix(`docpart:${sid}:`);
+    done = { count: parts.length, samples: {}, by: [] };
+  }
+  for (let k = 0; k < parts.length; k++) {
+    if (done.samples[k] != null) continue;
+    const stage = `Reading aloud with Gemini (${k + 1} of ${parts.length})`;
+    db.update("sources", sid, { stage, progress: round(0.02 + 0.6 * k / parts.length, 3) });
+    const voice = two ? ai.TTS_VOICES[k % ai.TTS_VOICES.length] : ai.TTS_VOICES[0];
+    let spoken;
+    for (const wait of [...BUSY_WAITS, null]) {
+      try { spoken = await ai.speakText(s, parts[k], voice); break; }
+      catch (e) {
+        const kept = k ? " The sections already read are kept, so Retry carries on from there." : "";
+        if (!(e instanceof ai.AiBusy)) throw new Error(`Gemini couldn't read this aloud: ${e.message}${kept}`);
+        if (wait === null) throw new Error(`${e.offline ? "There's no internet connection" : "Gemini is busy"}, so it stopped after ${k} of ${parts.length} sections. Press Retry to carry on from there.`);
+        db.update("sources", sid, { stage: waitingFor(e, wait) });
+        await sleep(wait * 1000);
+        db.update("sources", sid, { stage });
+      }
+    }
+    let pcm;
+    try { pcm = await speechPcm(spoken.bytes, spoken.mime); }
+    catch { throw new Error("Gemini's voice came back in a form this phone can't play. Press Retry to try again."); }
+    await db.filePut(`docpart:${sid}:${k}`, new Blob([pcm]));
+    done.samples[k] = pcm.length;
+    if (!done.by.includes(spoken.used)) done.by.push(spoken.used);
+    await db.kvSet(`docread:${sid}`, done);
+  }
+  db.update("sources", sid, { stage: "Putting the recording together", progress: 0.64 });
+  const GAP = Math.round(PCM_RATE * 0.7), gap = new Blob([new Int16Array(GAP)]);
+  const blobs = [], words = [];
+  let t = 0, size = 0;
+  for (let k = 0; k < parts.length; k++) {
+    const blob = await db.fileGet(`docpart:${sid}:${k}`);
+    if (!blob) {
+      delete done.samples[k];
+      await db.kvSet(`docread:${sid}`, done);
+      throw new Error("A section read aloud went missing from the phone. Press Retry to read it again.");
+    }
+    const len = done.samples[k] / PCM_RATE;
+    words.push(...T.wordsForSpokenText(parts[k], t + Math.min(0.1, len / 4), t + Math.max(len / 2, len - 0.1)));
+    blobs.push(blob); size += blob.size; t += len;
+    if (k < parts.length - 1) { blobs.push(gap); size += GAP * 2; t += GAP / PCM_RATE; }
+  }
+  await db.filePut(sid, new Blob([wavHeader(size), ...blobs], { type: "audio/wav" }));
+  await db.wordsSet(sid, words);
+  let note = `Read aloud from ${extOf(src.doc).slice(1).toUpperCase()} by ${done.by.sort().join(" and ") || "Gemini"}${two ? ", in two voices" : ""}.`;
+  if (cut) note += ` The file was long, so only the first ${D.MAX_CHARS / 1000}k characters were read.`;
+  db.update("sources", sid, { duration: round(t, 3), words_saved: true, heard_by: null, doc_note: note });
+  // The recording now holds it all, so the file and the sections aren't needed on the phone.
+  await Promise.all([db.fileDel(`doc:${sid}`), db.fileDelPrefix(`docpart:${sid}:`), db.kvDel(`docread:${sid}`)]);
+  await analyse(sid, words, t);
+}
+
+/** Sends one reference to the learner's File Search store on Gemini and waits for it to be indexed. */
+async function uploadReference(rid) {
+  const ref = db.one("refs", rid);
+  if (!ref) return;
+  const s = await settings();
+  if (!hasAi(s)) throw new Error("Add your Gemini key in Settings first: references are searched by Gemini.");
+  db.update("refs", rid, { status: "uploading", error: null });
+  if (!s.refs_store) {
+    s.refs_store = await ai.refsCreateStore(s);
+    await db.kvSet("settings", s);
+  }
+  let op = ref.op;
+  if (!op) {
+    const blob = await db.fileGet(`ref:${rid}`);
+    if (!blob) throw new Error("This file isn't on this phone any more. Remove it and add it again.");
+    op = await ai.refsStartUpload(s, s.refs_store, blob, ref.name, ai.REF_TYPES[ref.ext]);
+    db.update("refs", rid, { op });
+  }
+  let document;
+  try { document = await ai.refsWaitIndexed(s, op); }
+  catch (e) { db.update("refs", rid, { op: null }); throw e; }  // Retry sends it again
+  db.update("refs", rid, { status: "ready", document, error: null, op: null });
+  await db.fileDel(`ref:${rid}`);  // Gemini keeps it now, so the phone's copy isn't needed
+}
+
+/** Passages from the learner's references about a chapter: [passages, notice]. */
+async function referencePassages(s, title, terms, spoken) {
+  const query = `Topic: ${title}\nKey terms: ${terms.join(", ")}\nWhat the student said: ${spoken.slice(0, 800)}`;
+  let passages;
+  try { passages = await ai.findPassages(s, query); }
+  catch (e) { return [[], `Your references couldn't be searched (${e.message}), so this was checked against the lecture only.`]; }
+  if (!passages.length) return [[], "Nothing in your references matched this chapter, so it was checked against the lecture only."];
+  return [passages, null];
+}
+
 async function analyse(sid, words, total) {
   const s = await settings();
   if (!hasAi(s)) throw new Error("Gemini picks chapters and terms on the phone. Add your Gemini key in Settings.");
@@ -154,11 +280,22 @@ async function analyse(sid, words, total) {
     try { r = await ai.analyseLecture(s, T.linesForAi(words), total); break; }
     catch (e) {
       if (!(e instanceof ai.AiBusy) || wait === null) throw e;
-      db.update("sources", sid, { stage: `Gemini is busy, so waiting ${wait} seconds to try again` });
+      db.update("sources", sid, { stage: waitingFor(e, wait) });
       await sleep(wait * 1000);
     }
   }
   const { chapters, concepts } = T.fromAi(words, total, r.data, true);
+  let refNote = "";
+  const undefinedTerms = concepts.filter(c => !c.defined);
+  if (undefinedTerms.length && refsActive(s)) {
+    db.update("sources", sid, { stage: "Looking up definitions in your references", progress: 0.95 });
+    try {
+      const found = await ai.defineFromRefs(s, undefinedTerms.map(c => c.term));
+      for (const c of undefinedTerms) if (found[c.term]) [c.definition, c.definition_ref] = found[c.term];
+      const n = Object.keys(found).length;
+      if (n) refNote = ` ${n} definition${n === 1 ? "" : "s"} from your references.`;
+    } catch (e) { refNote = ` Your references couldn't be searched for definitions (${e.message}).`; }
+  }
   clearLearning(sid);
   const ids = chapters.map((ch, i) => db.put("chapters", { source_id: sid, idx: i, title: ch.title, start: ch.start, end: ch.end,
     listened: 0, summary: null, whatifs_made: 0, recall_due: null, recall_step: 0 }).id);
@@ -166,14 +303,16 @@ async function analyse(sid, words, total) {
     const row = db.put("concepts", { source_id: sid, chapter_id: ids[c.chapter], term: c.term, score: c.score, first_at: c.first_at,
       level: 1, covered: null, stability: null, difficulty: null, last_review: null, due: null, reps: 0, lapses: 0, retired: 0,
       next_card: 0, context: c.context, context_at: c.context_at, defined: c.defined ? 1 : 0, preview: c.preview ? 1 : 0,
-      definition: c.definition, definition_ref: null, expert: 0, known: 0 });
+      definition: c.definition, definition_ref: c.definition_ref || null, expert: 0, known: 0 });
     for (const card of c.cards) db.put("cards", { concept_id: row.id, lead_start: card.lead_start, cut: card.cut,
       target_end: card.target_end, resume_end: card.resume_end, sentence: card.sentence });
   }
   const vocab = [...concepts].sort((a, b) => b.score - a.score).slice(0, 40).map(c => c.term).join(" ");
-  const heard = db.one("sources", sid).heard_by;
+  const src = db.one("sources", sid), heard = src.heard_by;
+  const timing = src.doc ? " Word times are worked out from the text, so cut-out times in Review are approximate."
+    : heard ? ` Transcribed by ${heard}, so cut-out times in Review are approximate.` : "";
   db.update("sources", sid, { status: "ready", stage: null, progress: 1, duration: total, vocab, silences: T.silences(words),
-    note: `Chapters and terms by ${r.used}.${r.notice ? " " + r.notice : ""}${heard ? ` Transcribed by ${heard}, so cut-out times in Review are approximate.` : ""}` });
+    note: `${src.doc_note ? src.doc_note + " " : ""}Chapters and terms by ${r.used}.${r.notice ? " " + r.notice : ""}${refNote}${timing}` });
 }
 
 function clearLearning(sid) {
@@ -386,8 +525,14 @@ async function writeWhatifs(sid) {
   const concepts = db.where("concepts", c => c.source_id === sid && !c.retired).sort((a, b) => b.score - a.score);
   const words = await db.wordsGet(sid);
   const byNumber = new Map(todo.map(h => [h.idx + 1, h]));
-  const { questions, used, notice } = await ai.writeWhatifs(s, todo.map(h => ({ number: h.idx + 1, title: h.title,
-    text: T.textBetween(words, h.start, h.end), terms: concepts.filter(c => c.chapter_id === h.id).map(c => c.term) })));
+  const chapters = todo.map(h => ({ number: h.idx + 1, title: h.title, text: T.textBetween(words, h.start, h.end),
+    terms: concepts.filter(c => c.chapter_id === h.id).map(c => c.term) }));
+  if (refsActive(s)) {  // passages from the learner's references, so questions can compare them with the lecture
+    for (const c of chapters) {
+      try { c.passages = await ai.findPassages(s, `Topic: ${c.title}\nKey terms: ${c.terms.join(", ")}`); } catch { c.passages = []; }
+    }
+  }
+  const { questions, used, notice } = await ai.writeWhatifs(s, chapters);
   const kept = [];
   for (const item of questions) {
     const ch = byNumber.get(item.chapter);
@@ -400,7 +545,7 @@ async function writeWhatifs(sid) {
     const [lead, end] = whatifClip(words, ch, at, item.quote);
     db.put("whatifs", { source_id: sid, chapter_id: ch.id, at, lead_start: lead, clip_end: end, question: item.question, answer: item.answer,
       points: item.points, quote: item.quote, beyond: item.beyond ? 1 : 0, concept_ids: whatifConcepts(concepts.filter(c => c.chapter_id === ch.id), item),
-      status: null, tries: 0, heard: null, created: now(), done_at: null, kind: item.kind });
+      status: null, tries: 0, heard: null, created: now(), done_at: null, kind: item.kind, ref_label: item.ref_label, ref_quote: item.ref_quote });
   }
   for (const h of todo) db.update("chapters", h.id, { whatifs_made: 1 });  // the AI may skip a chapter with nothing to reason about
   return `Questions by ${used}.${notice ? " " + notice : ""}`;
@@ -506,13 +651,17 @@ async function makeMap(sid) {
 
 async function checkChapter(chapter, spoken) {
   const s = await settings();
-  let check = null, notice = null;
+  let check = null, notice = null, passages = [];
   if (hasAi(s)) {
     const terms = db.where("concepts", c => c.chapter_id === chapter.id && !c.retired).map(c => c.term);
-    try { check = await ai.checkExplanation(s, await db.wordsGet(chapter.source_id), chapter.start, chapter.end, spoken, terms); notice = check.notice; }
-    catch (e) { notice = e.message; }
+    let refNotice = null;
+    if (refsActive(s)) [passages, refNotice] = await referencePassages(s, chapter.title, terms, spoken);
+    try {
+      check = await ai.checkExplanation(s, await db.wordsGet(chapter.source_id), chapter.start, chapter.end, spoken, terms, passages.length ? passages : null);
+      notice = [check.notice, refNotice].filter(Boolean).join(" ") || null;
+    } catch (e) { notice = e.message; }
   }
-  return { check, notice, aiEnabled: hasAi(s) };
+  return { check, notice, aiEnabled: hasAi(s), usedRefs: passages.length > 0 };
 }
 
 async function heardFrom(body, vocab) {
@@ -541,7 +690,7 @@ async function get(path, q) {
   if ((m = path.match(/^\/api\/sources\/([\w-]+)\/transcript$/))) {
     const s = db.one("sources", m[1]), words = await db.wordsGet(m[1]);
     if (!s || !words.length) throw new HttpError("No transcript is saved for this lecture.", 404);
-    return { by: s.heard_by || "Gemini", approx: true, lines: T.transcriptLines(words), sparse: false };
+    return { by: s.doc ? "the file's own text" : s.heard_by || "Gemini", doc: !!s.doc, approx: true, lines: T.transcriptLines(words), sparse: false };
   }
   if ((m = path.match(/^\/api\/sources\/([\w-]+)\/whatifs$/))) return { ...whatifList(m[1]), ai: hasAi(await settings()) };
   if ((m = path.match(/^\/api\/sources\/([\w-]+)\/map$/))) return mapData(m[1]);
@@ -555,7 +704,8 @@ async function get(path, q) {
   }
   if (path === "/api/tracker") return tracker();
   if (path === "/api/settings") return publicSettings(await settings());
-  if (path === "/api/references") return [];
+  if (path === "/api/references") return db.rows("refs").sort((a, b) => b.created - a.created || b.id - a.id)
+    .map(r => ({ id: r.id, name: r.name, size: r.size, status: r.status, error: r.error, created: r.created }));
   if (path === "/api/summary") {
     const all = tracker();
     return { due: reviewQueue().length + recallQueue().length, clips: db.where("clips", p => p.done_at == null).length,
@@ -568,7 +718,7 @@ async function post(path, q, body) {
   let m;
   if (path === "/api/sources") {
     if (!(body instanceof Blob) || !body.size) throw new HttpError("The file was empty.");
-    const sid = crypto.randomUUID().replace(/-/g, "").slice(0, 12), name = q.name || "Untitled";
+    const sid = newId(), name = q.name || "Untitled";
     await db.filePut(sid, body);
     db.put("sources", { id: sid, name: name.replace(/\.[a-z0-9]{1,5}$/i, "").replace(/^[0-9A-F]{8}-/, "") || name, file_name: name,
       duration: null, status: "queued", stage: "Waiting", progress: 0, error: null, created: now(), position: 0, speed: 1.25,
@@ -576,10 +726,44 @@ async function post(path, q, body) {
     queueJob("import", sid);
     return { id: sid };
   }
+  if (path === "/api/documents") {
+    // A PDF, Word file or notes, read aloud by Gemini and learned like a lecture.
+    const name = q.name || "Notes", voice = q.voice || "";
+    if (!D.DOC_TYPES.includes(extOf(name))) throw new HttpError("Add a PDF, Word, text, Markdown or web page file.");
+    if (!["gemini", "gemini2"].includes(voice)) throw new HttpError("Choose a voice.");
+    if (!hasAi(await settings())) throw new HttpError("Add your Gemini key in Settings first: Gemini reads the text aloud.");
+    if (!(body instanceof Blob) || !body.size) throw new HttpError("The file was empty.");
+    if (body.size > D.MAX_BYTES) throw new HttpError("That file is over 50 MB. Split it into smaller parts.");
+    const sid = newId();
+    await db.filePut(`doc:${sid}`, body);
+    db.put("sources", { id: sid, name: name.replace(/\.[a-z0-9]{1,5}$/i, "") || name, file_name: `${sid}.wav`, doc: name, voice,
+      duration: null, status: "queued", stage: "Waiting", progress: 0, error: null, created: now(), position: 0, speed: 1.25,
+      silences: [], vocab: "", note: null, heard_by: null });
+    queueJob("document", sid);
+    return { id: sid };
+  }
+  if (path === "/api/references") {
+    const name = q.name || "Reference", ext = extOf(name);
+    if (!ai.REF_TYPES[ext]) throw new HttpError("Add a PDF, Word, text or Markdown file.");
+    if (!(body instanceof Blob) || !body.size) throw new HttpError("The file was empty.");
+    if (body.size > ai.REF_MAX_BYTES) throw new HttpError("That file is over 100 MB, Gemini's limit. Split the book and add one chapter at a time.");
+    const row = db.put("refs", { name: name.replace(/\.[a-z0-9]{1,5}$/i, "").slice(0, 200) || "Reference", ext, size: body.size,
+      status: "queued", error: null, document: null, op: null, created: now() });
+    await db.filePut(`ref:${row.id}`, body);
+    queueJob("reference", row.id);
+    return { id: row.id };
+  }
+  if ((m = path.match(/^\/api\/references\/(\d+)\/retry$/))) {
+    const id = Number(m[1]);
+    if (!db.one("refs", id)) throw new HttpError("Not found", 404);
+    db.update("refs", id, { status: "queued", error: null });
+    queueJob("reference", id);
+    return { ok: true };
+  }
   if ((m = path.match(/^\/api\/sources\/([\w-]+)\/retry$/))) {
     const s = db.one("sources", m[1]);
     db.update("sources", m[1], { status: "queued", stage: "Waiting", progress: 0, error: null });
-    queueJob(s?.words_saved ? "reanalyse" : "import", m[1]);
+    queueJob(jobFor(s), m[1]);
     return { ok: true };
   }
   if ((m = path.match(/^\/api\/sources\/([\w-]+)\/reanalyse$/))) {
@@ -635,7 +819,7 @@ async function post(path, q, body) {
     const heard = await heardFrom(body, vocab);
     const spoken = heard.text;
     if (!spoken.trim()) return { heard: "", concepts: [], empty: true };
-    const { check, notice, aiEnabled } = await checkChapter(chapter, spoken);
+    const { check, notice, aiEnabled, usedRefs } = await checkChapter(chapter, spoken);
     const recall = m[2] === "recall";
     const concepts = await gradeSummary(chapter, spoken, check, recall ? "Forgotten when recalling from memory" : undefined);
     const score = summaryScore(concepts, check), below = belowStandard(score, check);
@@ -653,7 +837,7 @@ async function post(path, q, body) {
       }
       out.split = split;
     }
-    if (check) Object.assign(out, { verdict: check.verdict, summary: check.summary, points: check.points, beyond: [], used_refs: false });
+    if (check) Object.assign(out, { verdict: check.verdict, summary: check.summary, points: check.points, beyond: check.beyond || [], used_refs: usedRefs });
     return out;
   }
   if ((m = path.match(/^\/api\/chapters\/(\d+)\/skip$/))) {
@@ -736,12 +920,19 @@ async function post(path, q, body) {
     if (!heard.text.trim()) return { heard: "", empty: true };
     const s = await settings();
     if (!hasAi(s)) throw new HttpError("Checking this needs Gemini. Add your Gemini key in Settings.");
+    let passages = [], refNotice = null;
+    if (refsActive(s)) {
+      try { passages = await ai.findPassages(s, `Question: ${w.question}\nAnswer: ${w.answer}`); }
+      catch (e) { refNotice = `Your references couldn't be searched (${e.message}).`; }
+      if (!passages.length && !refNotice) refNotice = "Nothing in your references matched this question.";
+    }
     let r;
-    try { r = await ai.judgeWhatif(s, T.textBetween(await db.wordsGet(w.source_id), chapter.start, chapter.end), w, heard.text, w.kind); }
+    try { r = await ai.judgeWhatif(s, T.textBetween(await db.wordsGet(w.source_id), chapter.start, chapter.end), w, heard.text, w.kind, passages.length ? passages : null); }
     catch (e) { throw new HttpError(e.message, 502); }
     recordWhatif(w, r.verdict, heard.text);
-    return { ...r, heard: heard.text, heard_by: heard.by, hear_notice: heard.notice, answer: w.answer, points: w.points, quote: w.quote,
-             at: w.at, beyond: !!w.beyond, used_refs: false };
+    if (!r.reference && w.ref_label) { r.reference = w.ref_label; r.reference_quote = w.ref_quote; }
+    return { ...r, notice: [r.notice, refNotice].filter(Boolean).join(" ") || null, heard: heard.text, heard_by: heard.by, hear_notice: heard.notice,
+             answer: w.answer, points: w.points, quote: w.quote, at: w.at, beyond: !!w.beyond, used_refs: passages.length > 0 };
   }
   if ((m = path.match(/^\/api\/whatifs\/(\d+)\/overrule$/))) {
     const w = db.one("whatifs", Number(m[1]));
@@ -779,11 +970,11 @@ async function post(path, q, body) {
     const s = await settings();
     if (typeof body?.gemini_key === "string") s.gemini_key = body.gemini_key.trim();
     if (ai.MODELS[body?.gemini_model]) s.gemini_model = body.gemini_model;
+    if (typeof body?.use_refs === "boolean") s.use_refs = body.use_refs;
     await db.kvSet("settings", s);
     return publicSettings(s);
   }
   if (path === "/api/settings/test") return ai.testKey(await settings());
-  if (path === "/api/documents" || path === "/api/references") throw new HttpError("This isn't available in the phone version yet.");
   throw new HttpError("Not found", 404);
 }
 
@@ -797,7 +988,19 @@ async function del(path) {
     db.removeWhere("marks", k => k.source_id === sid);
     db.remove("sources", sid);
     if (mediaUrls.has(sid)) { URL.revokeObjectURL(mediaUrls.get(sid)); mediaUrls.delete(sid); }
-    await Promise.all([db.fileDel(sid), db.wordsDel(sid), db.kvDel(`partial:${sid}`)]);
+    await Promise.all([db.fileDel(sid), db.wordsDel(sid), db.kvDel(`partial:${sid}`), db.fileDel(`doc:${sid}`),
+                       db.fileDelPrefix(`docpart:${sid}:`), db.kvDel(`docread:${sid}`)]);
+    return { ok: true };
+  }
+  if ((m = path.match(/^\/api\/references\/(\d+)$/))) {
+    const ref = db.one("refs", Number(m[1]));
+    if (!ref) throw new HttpError("Not found", 404);
+    if (ref.status === "queued" || ref.status === "uploading") throw new HttpError("Wait until this file has finished uploading, then remove it.");
+    if (ref.document) {
+      try { await ai.refsDelete(await settings(), ref.document); } catch (e) { throw new HttpError(e.message); }
+    }
+    db.remove("refs", ref.id);
+    await db.fileDel(`ref:${ref.id}`);
     return { ok: true };
   }
   throw new HttpError("Not found", 404);

@@ -2,8 +2,8 @@
 // small, so they're loaded into memory when the app opens and every change is written straight back.
 // Recordings and transcripts are big, so they're read only when needed.
 
-const DB_NAME = "earmark", VERSION = 1;
-export const TABLES = ["sources", "chapters", "concepts", "cards", "reviews", "clips", "whatifs", "pairs", "links", "marks"];
+const DB_NAME = "earmark", VERSION = 2;  // 2 added references
+export const TABLES = ["sources", "chapters", "concepts", "cards", "reviews", "clips", "whatifs", "pairs", "links", "marks", "refs"];
 let idb = null;
 const mem = {}, top = {};
 let writes = Promise.resolve();
@@ -17,9 +17,16 @@ export async function open() {
     r.onupgradeneeded = () => {
       for (const s of [...TABLES, "kv", "files"]) if (!r.result.objectStoreNames.contains(s)) r.result.createObjectStore(s);
     };
+    // An older version open in another tab or window holds the storage until it's closed.
+    r.onblocked = () => {
+      const view = document.getElementById("view");
+      if (view) view.innerHTML = `<p>Earmark has been updated, but an older copy is still open in another tab or window. Close it, and Earmark opens here.</p>`;
+    };
     r.onsuccess = () => res(r.result);
     r.onerror = () => rej(r.error);
   });
+  // A newer version opening elsewhere needs the storage: this page closes it and reloads as the new version.
+  idb.onversionchange = () => { idb.close(); location.reload(); };
   for (const t of TABLES) {
     const [keys, values] = await Promise.all([req(tx(t).getAllKeys()), req(tx(t).getAll())]);
     mem[t] = new Map(keys.map((k, i) => [k, values[i]]));
@@ -64,6 +71,8 @@ export const kvDel = key => req(tx("kv", "readwrite").delete(key));
 export const fileGet = sid => req(tx("files").get(sid));
 export const filePut = (sid, blob) => req(tx("files", "readwrite").put(blob, sid));
 export const fileDel = sid => req(tx("files", "readwrite").delete(sid));
+/** Deletes every file whose name starts with prefix, such as the sections of a document read aloud. */
+export const fileDelPrefix = prefix => req(tx("files", "readwrite").delete(IDBKeyRange.bound(prefix, prefix + "\uffff")));
 
 const wordCache = new Map();
 export async function wordsGet(sid) {

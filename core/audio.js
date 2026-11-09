@@ -312,3 +312,69 @@ export function duration(blob) {
     a.src = url;
   });
 }
+
+// ---------------------------------------------------------------- text read aloud by Gemini
+
+/** The 44-byte header of a 16 kHz mono 16-bit WAV file holding `size` bytes of samples. */
+export function wavHeader(size, rate = RATE) {
+  const out = new DataView(new ArrayBuffer(44));
+  const text = (o, s) => [...s].forEach((c, k) => out.setUint8(o + k, c.charCodeAt(0)));
+  text(0, "RIFF"); out.setUint32(4, 36 + size, true); text(8, "WAVEfmt ");
+  out.setUint32(16, 16, true); out.setUint16(20, 1, true); out.setUint16(22, 1, true);
+  out.setUint32(24, rate, true); out.setUint32(28, rate * 2, true); out.setUint16(32, 2, true); out.setUint16(34, 16, true);
+  text(36, "data"); out.setUint32(40, size, true);
+  return new Uint8Array(out.buffer);
+}
+
+/** 16-bit PCM in a WAV file: {channels, rate}, or null for anything else. */
+function readWav(bytes) {
+  const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const tag = o => String.fromCharCode(...bytes.subarray(o, o + 4));
+  if (bytes.length < 44 || tag(0) !== "RIFF" || tag(8) !== "WAVE") return null;
+  let at = 12, fmt = null;
+  while (at + 8 <= bytes.length) {
+    const id = tag(at), size = v.getUint32(at + 4, true), body = at + 8;
+    if (id === "fmt ") fmt = { format: v.getUint16(body, true), channels: v.getUint16(body + 2, true),
+                               rate: v.getUint32(body + 4, true), bits: v.getUint16(body + 14, true) };
+    if (id === "data" && fmt) {
+      if (fmt.format !== 1 || fmt.bits !== 16 || !fmt.channels) return null;
+      const frames = Math.floor(Math.min(size, bytes.length - body) / 2 / fmt.channels);
+      const channels = [...Array(fmt.channels)].map(() => new Float32Array(frames));
+      for (let i = 0; i < frames; i++) for (let c = 0; c < fmt.channels; c++)
+        channels[c][i] = v.getInt16(body + (i * fmt.channels + c) * 2, true) / 32768;
+      return { channels, rate: fmt.rate };
+    }
+    at = body + size + (size & 1);
+  }
+  return null;
+}
+
+/** Speech from a Gemini voice (WAV, or raw 16-bit PCM sent as audio/L16) as 16 kHz mono 16-bit
+    samples, with the silence at either end trimmed to a tenth of a second. */
+export async function speechPcm(bytes, mime = "") {
+  let samples;
+  if (/l16|pcm/i.test(mime) && !/wav/i.test(mime)) {
+    const rate = Number((mime.match(/rate=(\d+)/i) || [])[1]) || 24000;
+    const n = Math.floor(bytes.byteLength / 2), v = new DataView(bytes.buffer, bytes.byteOffset, n * 2);
+    const raw = new Float32Array(n);
+    for (let i = 0; i < n; i++) raw[i] = v.getInt16(i * 2, true) / 32768;
+    samples = toMono16k([raw], rate);
+  } else {
+    const wav = readWav(bytes);
+    if (wav) samples = toMono16k(wav.channels, wav.rate);
+    else {
+      const buf = await new OfflineAudioContext(1, 1, RATE).decodeAudioData(bytes.slice().buffer);
+      samples = toMono16k([...Array(buf.numberOfChannels).keys()].map(c => buf.getChannelData(c)), buf.sampleRate);
+    }
+  }
+  const loud = 0.02, pad = Math.round(RATE * 0.1);
+  let a = 0, b = samples.length - 1;
+  while (a < b && Math.abs(samples[a]) < loud) a++;
+  while (b > a && Math.abs(samples[b]) < loud) b--;
+  samples = samples.subarray(Math.max(0, a - pad), Math.min(samples.length, b + pad + 1));
+  const pcm = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i++) pcm[i] = Math.max(-1, Math.min(1, samples[i])) * 32767;
+  return pcm;
+}
+
+export const PCM_RATE = RATE;

@@ -260,11 +260,12 @@ const NOTE_UPLOAD = "Works best with clear speech in English. Keep Earmark open 
 async function showLibrary() {
   view.innerHTML = `
     <h1>Library</h1>
-    <p class="muted">Add a lecture recording. Gemini transcribes it, splits it into chapters and picks the terms to learn. Everything is kept on this phone.</p>
+    <p class="muted">Add a lecture recording, or a PDF, Word file or notes for Gemini to read aloud. Gemini splits it into chapters and picks the terms to learn. Everything is kept on this phone.</p>
     <div class="drop" id="drop">
-      <p class="drop-hint">Drop audio here, or</p>
+      <p class="drop-hint">Drop audio, a PDF or notes here, or</p>
       <div class="row" style="justify-content:center">
         <button class="primary" id="pick">Choose audio files</button>
+        <button id="pick-doc">Add a PDF or notes</button>
       </div>
       <input type="file" id="doc-file" accept="${DOC_TYPES.join(",")}" hidden>
       <input type="file" id="file" accept="audio/*,.mp3,.m4a,.wav,.ogg,.opus,.flac,.aac,.webm" multiple hidden>
@@ -275,6 +276,7 @@ async function showLibrary() {
   const drop = $("#drop"), file = $("#file"), docFile = $("#doc-file");
   $("#pick").onclick = () => file.click();
   file.onchange = () => uploadAll(file.files);
+  $("#pick-doc").onclick = () => docFile.click();
   docFile.onchange = () => { if (docFile.files[0]) askVoice(docFile.files[0]); docFile.value = ""; };
   drop.ondragover = e => { e.preventDefault(); drop.classList.add("over"); };
   drop.ondragleave = () => drop.classList.remove("over");
@@ -305,7 +307,6 @@ async function showLibrary() {
     panel.innerHTML = `<h2 style="overflow-wrap:anywhere">Turn “${esc(f.name)}” into a lecture</h2>
       <p class="muted small">The text is read aloud, then Earmark splits it into chapters and terms like any lecture. Page numbers, links and the reference list are left out. A scanned PDF can't be read: it holds pictures of pages, not text.</p>
       ${option("gemini", "Gemini voice", "Natural. Uses your Gemini key: about $0.55 to $0.80 per hour of audio until the end of 2026, then double, or free on Gemini's free tier. The text is sent to Google.")}
-      ${option("windows", "Windows voice", `Free, and the text stays on ${PC}. Sounds robotic.${CLOUD ? " Not available in a codespace." : ""}`)}
       <label class="check small"><input type="checkbox" id="doc-two" ${saved.endsWith("2") ? "checked" : ""}> Two voices take turns, section by section</label>
       <p class="small error" id="doc-msg" role="status" style="margin:.4rem 0"></p>
       <div class="row"><button class="primary" id="doc-go">Make the lecture</button><button id="doc-cancel">Cancel</button></div>`;
@@ -329,7 +330,7 @@ async function showLibrary() {
 
   async function uploadAll(files) {
     const docs = [...files].filter(f => DOC_TYPES.some(t => f.name.toLowerCase().endsWith(t)));
-    if (docs.length) toast("PDFs and notes can't be turned into lectures on the phone yet. Add audio files.");
+    if (docs.length) askVoice(docs[0]);
     files = [...files].filter(f => !docs.includes(f));
     if (!files.length) return;
     for (const f of files) {
@@ -594,9 +595,10 @@ async function showSource(id) {
     });
     return groups;
   };
-  const txText = groups => [src.name, `Transcribed by ${tx.by === "this PC" ? SPEECH : tx.by}.`, ""].concat(groups.flatMap(g => [
+  const txText = groups => [src.name, tx.doc ? "The file's own text, as read aloud." : `Transcribed by ${tx.by === "this PC" ? SPEECH : tx.by}.`, ""].concat(groups.flatMap(g => [
     `${g.title} (${clock(g.start)})`, ...g.paras.map(p => `[${clock(p.start)}] ${p.lines.map(l => l.text).join(" ")}`), ""])).join("\n");
-  const txByText = () => tx.by === "this PC"
+  const txByText = () => tx.doc ? "The file's own text, as read aloud. Times are worked out from the text, so a jump can land a second or two off."
+    : tx.by === "this PC"
     ? `Transcribed by ${SPEECH}. It can mishear unusual or medical terms.`
     : `Transcribed by ${tx.by}. Times are approximate, so a jump can land a second or two off.`;
   let txLoading = false;
@@ -1710,7 +1712,7 @@ async function showSettings() {
   view.innerHTML = `<h1>Settings</h1>
     <div class="panel">
       <h2>Gemini</h2>
-      <p class="muted small">On the phone, Gemini does the hearing and checking: it transcribes your lectures, picks chapters and terms, hears your spoken answers and checks your explanations. Create a key at aistudio.google.com. <b>On Gemini's free tier, Google may use what you send to improve its products and people may read it,</b> so don't include anything private. Paid use doesn't improve its products.</p>
+      <p class="muted small">On the phone, Gemini does the hearing and checking: it transcribes your lectures, reads PDFs and notes aloud, picks chapters and terms, hears your spoken answers, checks your explanations and searches your references. Create a key at aistudio.google.com. <b>On Gemini's free tier, Google may use what you send to improve its products and people may read it,</b> so don't include anything private. Paid use doesn't improve its products.</p>
       <label class="small" for="gemini-key">API key</label>
       <div class="row">
         <input type="password" class="grow" id="gemini-key" autocomplete="off" placeholder="${s.gemini_key ? `Saved, ending ${esc(s.gemini_tail)}` : "Paste your key"}">
@@ -1737,8 +1739,19 @@ async function showSettings() {
       <p class="small">Your lectures, transcripts and progress are kept on this phone only, in Chrome. Nothing is on a server, and your PC isn't needed.${use}</p>
       <p class="small muted">Clearing this site's data in Chrome, or uninstalling the app, deletes them, so keep your original recordings. To open Earmark like an app, tap Chrome's <b>⋮</b> menu and choose <b>Install app</b>. Listening and review work without internet; transcribing and checking need it.</p>
     </div>
+    <div class="panel" id="refs-panel">
+      <h2>Your references</h2>
+      <p class="muted small">Add sources you trust, such as textbook chapters or your own notes, as PDF, Word, text or Markdown files of up to 100 MB. Gemini indexes them on your Gemini account, so the phone doesn't keep a copy. Then, when you finish a chapter, your explanation is checked against the lecture and these, terms the lecture doesn't define get definitions from them, with the source shown, and expert questions can compare them with the lecture. One chapter at a time works better than a whole book. <b>The files are sent to Google;</b> on Gemini's free tier, Google may use them.</p>
+      <label class="check small"><input type="checkbox" id="use-refs" ${s.use_refs ? "checked" : ""}> Use my references when checking explanations and defining terms</label>
+      <div class="row" style="margin:.5rem 0"><button class="primary" id="ref-add">Add files</button>
+        <input type="file" id="ref-file" accept=".pdf,.docx,.txt,.md,.html,.htm" multiple hidden></div>
+      <p class="small" id="refs-msg" role="status" style="margin:.2rem 0"></p>
+      <div id="refs-list"></div>
+    </div>
     <div class="panel small muted">
       <p><b>What gets sent,</b> only to Gemini, with your key: your lectures' audio in 3-minute pieces to be transcribed, then their transcripts to pick chapters and terms; your spoken answers to be heard; and your explanations and answers, with the part of the lecture they're about, to be checked.</p>
+      <p><b>PDFs and notes</b> you turn into lectures: their text, to be read aloud.</p>
+      <p><b>References:</b> the files you add above, once, and searches of them when you finish a chapter, terms are picked or expert questions are written and checked.</p>
       <p style="margin:0"><b>Your key</b> is kept on this phone and only sent to Gemini.</p>
     </div>`;
   const msg = $("#key-msg");
@@ -1751,6 +1764,7 @@ async function showSettings() {
     $("#gemini-key").placeholder = `Saved, ending ${s.gemini_tail}`;
     $("#key-clear").hidden = false;
     msg.className = "small"; msg.textContent = "Saved. Press Test to check it.";
+    refsMsg();
   };
   $("#key-clear").onclick = async () => {
     if (!confirm("Remove your Gemini key from this phone?")) return;
@@ -1758,6 +1772,7 @@ async function showSettings() {
     $("#gemini-key").placeholder = "Paste your key";
     $("#key-clear").hidden = true;
     msg.textContent = "Removed.";
+    refsMsg();
   };
   $("#key-test").onclick = async () => {
     msg.className = "small"; msg.textContent = "Testing…";
@@ -1766,6 +1781,49 @@ async function showSettings() {
     msg.textContent = r.message;
   };
   $("#gemini-model").onchange = e => update({ gemini_model: e.target.value });
+  // References: list, add, remove. The list refreshes while files are being indexed.
+  let refsTimer;
+  const refsMsg = () => {
+    const m = $("#refs-msg");
+    m.className = "small error";
+    m.textContent = s.gemini_key ? "" : "Add your Gemini key above first: Gemini indexes and searches your references.";
+  };
+  const STATE = { queued: "Waiting", uploading: "Indexing on Gemini…", ready: "Ready", failed: "Failed" };
+  const drawRefs = async () => {
+    clearTimeout(refsTimer);
+    const list = await api("/api/references");
+    const box = $("#refs-list");
+    if (!box) return;
+    box.innerHTML = list.length ? list.map(r => `<div class="result-row">
+        <span class="grow"><span class="term">${esc(r.name)}</span> <span class="muted small">${(r.size / 1048576).toFixed(1)} MB</span>
+          ${r.status === "failed" ? `<br><span class="error small">${esc(r.error || "")}</span>` : ""}</span>
+        <span class="small ${r.status === "ready" ? "right" : r.status === "failed" ? "wrong" : "muted"}">${STATE[r.status] || r.status}</span>
+        ${r.status === "failed" ? `<button data-ref-retry="${r.id}">Retry</button>` : ""}
+        <button class="danger" data-ref-del="${r.id}" ${r.status === "queued" || r.status === "uploading" ? "disabled" : ""}>Remove</button>
+      </div>`).join("") : `<p class="muted small" style="margin:0">No references yet.</p>`;
+    box.querySelectorAll("[data-ref-del]").forEach(b => b.onclick = async () => {
+      if (!confirm("Remove this file from your references? It is deleted from your Gemini account too.")) return;
+      try { await api(`/api/references/${b.dataset.refDel}`, { method: "DELETE" }); } catch (e) { toast(e.message); }
+      drawRefs();
+    });
+    box.querySelectorAll("[data-ref-retry]").forEach(b => b.onclick = async () => { await post(`/api/references/${b.dataset.refRetry}/retry`); drawRefs(); });
+    if (list.some(r => r.status === "queued" || r.status === "uploading")) refsTimer = setTimeout(drawRefs, 3000);
+  };
+  $("#ref-add").onclick = () => $("#ref-file").click();
+  $("#ref-file").onchange = async e => {
+    for (const f of e.target.files) {
+      $("#refs-msg").className = "small"; $("#refs-msg").textContent = `Adding ${f.name}…`;
+      try { await api(`/api/references?name=${encodeURIComponent(f.name)}`, { method: "POST", body: f }); }
+      catch (err) { toast(`${f.name}: ${err.message}`); }
+    }
+    e.target.value = "";
+    refsMsg();
+    drawRefs();
+  };
+  $("#use-refs").onchange = e => update({ use_refs: e.target.checked });
+  cleanup = () => clearTimeout(refsTimer);
+  refsMsg();
+  drawRefs();
   setupMicPanel();
 }
 
